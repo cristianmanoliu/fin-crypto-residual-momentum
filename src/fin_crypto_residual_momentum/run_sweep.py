@@ -1,5 +1,8 @@
-"""Residual momentum sweep runner with full honesty battery.
-Run: uv run python -m fin_crypto_residual_momentum.run_sweep --instrument spot
+"""Momentum sweep runner with full honesty battery.
+Run: uv run python -m fin_crypto_residual_momentum --instrument spot --signal residual
+     uv run python -m fin_crypto_residual_momentum --instrument spot --signal raw
+     uv run python -m fin_crypto_residual_momentum --instrument spot --signal blend
+     uv run python -m fin_crypto_residual_momentum --instrument spot --signal compare
 Exit 0 = PASS, 1 = FAIL, 2 = kill condition."""
 import argparse
 import datetime as dt
@@ -28,8 +31,17 @@ from fin_crypto_lab.sweep import (
 )
 from fin_crypto_lab.universe import build_universe
 
-from fin_crypto_residual_momentum.signals import residual_momentum
-from fin_crypto_residual_momentum.sweep import GRID, config_name
+from fin_crypto_residual_momentum.signals import (
+    blend_momentum,
+    raw_momentum,
+    residual_momentum,
+)
+from fin_crypto_residual_momentum.sweep import (
+    BLEND_GRID,
+    RAWMOM_GRID,
+    RESMOM_GRID,
+    config_name,
+)
 
 log = logging.getLogger("fin_crypto_residual_momentum.sweep")
 
@@ -39,8 +51,9 @@ RESULTS_DIR = Path("results")
 def write_verdict(rows, checks, family_pass, extra, run_label) -> Path:
     out_dir = RESULTS_DIR / run_label
     out_dir.mkdir(parents=True, exist_ok=True)
+    sig_label = extra.get("signal_type", "resmom")
     lines = [
-        f"# Residual momentum {extra.get('instrument', '')} verdict "
+        f"# {sig_label} momentum {extra.get('instrument', '')} verdict "
         f"({dt.date.today()})",
         "",
         f"## FAMILY: {'PASS' if family_pass else 'FAIL'}",
@@ -72,15 +85,86 @@ def write_verdict(rows, checks, family_pass, extra, run_label) -> Path:
     return out_dir
 
 
-def main() -> int:
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s")
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--instrument", required=True,
-                        choices=["spot", "futures"])
-    args = parser.parse_args()
-    instrument = args.instrument
+def write_comparison(all_rows: dict[str, list[dict]], instrument,
+                     bm_test_sharpe) -> Path:
+    """Side-by-side comparison: all signal types."""
+    out_dir = RESULTS_DIR / f"crypto_{instrument}_compare_{dt.date.today().isoformat()}"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
+    by_key: dict[tuple, dict[str, dict]] = {}
+    for sig_type, rows in all_rows.items():
+        for r in rows:
+            by_key.setdefault((r["lookback"], r["top_n"]), {})[sig_type] = r
+
+    signal_types = list(all_rows.keys())
+    header_cols = []
+    for st in signal_types:
+        header_cols += [f"{st} train SR", f"{st} test SR"]
+    header = "| lookback | top_n | " + " | ".join(header_cols) + " |"
+    sep = "|---|---" + "|---" * len(header_cols) + "|"
+
+    lines = [
+        f"# Momentum comparison: {instrument} ({dt.date.today()})",
+        "",
+        f"Benchmark test Sharpe: {bm_test_sharpe:.2f}",
+        "",
+        header,
+        sep,
+    ]
+    for (lb, n) in sorted(by_key):
+        cells = []
+        for st in signal_types:
+            r = by_key[(lb, n)].get(st)
+            if r:
+                cells += [f"{r['train_sharpe']:.2f}", f"{r['test_sharpe']:.2f}"]
+            else:
+                cells += ["", ""]
+        lines.append(f"| {lb} | {n} | " + " | ".join(cells) + " |")
+
+    lines += ["", "## Selected configs"]
+    for st in signal_types:
+        sel = next((r for r in all_rows[st] if r["selected"]), None)
+        if sel:
+            lines.append(
+                f"- {st.capitalize()}: **{sel['name']}** "
+                f"(train SR {sel['train_sharpe']:.2f}, "
+                f"test SR {sel['test_sharpe']:.2f})"
+            )
+
+    lines += ["", "## Pairwise summary"]
+    pairs = [("residual", "raw"), ("blend", "raw"), ("blend", "residual")]
+    for a, b in pairs:
+        if a not in all_rows or b not in all_rows:
+            continue
+        deltas = [
+            by_key[k][a]["test_sharpe"] - by_key[k][b]["test_sharpe"]
+            for k in by_key if a in by_key[k] and b in by_key[k]
+        ]
+        if not deltas:
+            continue
+        avg = np.mean(deltas)
+        wins = sum(1 for d in deltas if d > 0)
+        lines.append(
+            f"- {a.capitalize()} vs. {b}: mean delta {avg:+.3f}, "
+            f"wins {wins}/{len(deltas)}"
+        )
+
+    best_st = max(signal_types,
+                  key=lambda st: np.mean([r["test_sharpe"] for r in all_rows[st]]))
+    lines += [
+        "",
+        f"Best average test SR: **{best_st}** "
+        f"({np.mean([r['test_sharpe'] for r in all_rows[best_st]]):.3f})",
+    ]
+
+    path = out_dir / "comparison.md"
+    path.write_text("\n".join(lines) + "\n")
+    return out_dir
+
+
+def _setup_instrument(instrument: str):
+    """Return (data_dir, cost_fn, slip_levels, decision_slip, form_start,
+    form_end, train_end) for the given instrument."""
     data_dir = (config.SPOT_DATA_DIR if instrument == "spot"
                 else config.FUTURES_DATA_DIR)
     cost_fn = (config.spot_cost_frac if instrument == "spot"
@@ -89,7 +173,6 @@ def main() -> int:
                    else config.FUTURES_SLIP_LEVELS_BP)
     decision_slip = (config.SPOT_DECISION_SLIP_BP if instrument == "spot"
                      else config.FUTURES_DECISION_SLIP_BP)
-
     if instrument == "futures":
         form_start = config.FUTURES_FORM_START
         form_end = config.FUTURES_FORM_END
@@ -98,16 +181,21 @@ def main() -> int:
         form_start = config.FORM_START
         form_end = config.FORM_END
         train_end = config.TRAIN_END
+    return data_dir, cost_fn, slip_levels, decision_slip, form_start, form_end, train_end
+
+
+def _build_common(instrument):
+    """Build shared objects: sessions, formations, universe, panel, f_idx, market_col."""
+    (data_dir, cost_fn, slip_levels, decision_slip,
+     form_start, form_end, train_end) = _setup_instrument(instrument)
 
     sessions = crypto_sessions(
-        str(form_start - dt.timedelta(days=400)),
-        str(form_end))
+        str(form_start - dt.timedelta(days=400)), str(form_end))
     formations = [d for d in weekly_formations(sessions)
                   if form_start <= d <= form_end]
 
     ohlcv_dir = data_dir / "ohlcv"
-    inst_grid = [g for g in GRID if g["instrument"] == instrument]
-    max_n = max(g["top_n"] for g in inst_grid)
+    max_n = 30
     universe = build_universe(ohlcv_dir, formations, lookback=90, top_n=max_n)
     log.info("universe: %d snapshots, %d unique symbols",
              universe["snapshot_date"].n_unique(),
@@ -125,23 +213,6 @@ def main() -> int:
     log.info("market_col=%s (%s)",
              market_col, symbols[market_col] if market_col is not None else "EW")
 
-    sig_cache: dict[tuple, dict[dt.date, dict[str, float]]] = {}
-
-    def get_signals(lb: int, sk: int, bw: int | None) -> dict[dt.date, dict[str, float]]:
-        key = (lb, sk, bw)
-        if key in sig_cache:
-            return sig_cache[key]
-        sig_by_form: dict[dt.date, dict[str, float]] = {}
-        for d in formations:
-            fi = f_idx[d]
-            if fi < lb:
-                continue
-            raw = residual_momentum(panel, fi, lookback=lb, skip=sk,
-                                    market_col=market_col, beta_window=bw)
-            sig_by_form[d] = dict(zip(panel.symbols, raw.tolist()))
-        sig_cache[key] = sig_by_form
-        return sig_by_form
-
     bm_targets = benchmark_targets(universe, formations)
     bm_sw = slippage_sweep(panel, bm_targets, nav0=config.NAV_DEFAULT,
                            slip_levels=slip_levels, cost_frac_fn=cost_fn)
@@ -151,13 +222,56 @@ def main() -> int:
         pl.col("date").is_in(formations)).sort("date")
     bm_dates = bm_marks["date"].to_list()[1:]
     bm_test = [r for r, d in zip(bm_weekly, bm_dates) if d > train_end]
+    bm_test_sharpe = weekly_sharpe(bm_test)
+
+    return (panel, formations, f_idx, universe, market_col,
+            cost_fn, slip_levels, decision_slip, train_end,
+            bm_test_sharpe)
+
+
+def run_signal(instrument: str, signal_type: str,
+               common=None) -> tuple[list[dict], int, float]:
+    """Run one signal type through the sweep and honesty battery.
+    Returns (rows, exit_code, bm_test_sharpe)."""
+    if common is None:
+        common = _build_common(instrument)
+    (panel, formations, f_idx, universe, market_col,
+     cost_fn, slip_levels, decision_slip, train_end,
+     bm_test_sharpe) = common
+
+    grids = {"residual": RESMOM_GRID, "raw": RAWMOM_GRID, "blend": BLEND_GRID}
+    grid = grids[signal_type]
+    inst_grid = [g for g in grid if g["instrument"] == instrument]
+
+    sig_cache: dict[tuple, dict[dt.date, dict[str, float]]] = {}
+
+    def get_signals(lb: int, sk: int, bw: int | None = None):
+        key = (signal_type, lb, sk, bw)
+        if key in sig_cache:
+            return sig_cache[key]
+        sig_by_form: dict[dt.date, dict[str, float]] = {}
+        for d in formations:
+            fi = f_idx[d]
+            if fi < lb:
+                continue
+            if signal_type == "residual":
+                raw = residual_momentum(panel, fi, lookback=lb, skip=sk,
+                                        market_col=market_col, beta_window=bw)
+            elif signal_type == "blend":
+                raw = blend_momentum(panel, fi, lookback=lb, skip=sk,
+                                     market_col=market_col, beta_window=bw)
+            else:
+                raw = raw_momentum(panel, fi, lookback=lb, skip=sk)
+            sig_by_form[d] = dict(zip(panel.symbols, raw.tolist()))
+        sig_cache[key] = sig_by_form
+        return sig_by_form
 
     rows, weekly_own = [], {}
     results_cache: dict[str, dict] = {}
     nonfinite = False
 
     for g in inst_grid:
-        name = config_name(g)
+        name = config_name(g, signal_type)
         sig_by_form = get_signals(g["lookback"], g["skip"], g.get("beta_window"))
         tgt = topn_targets(sig_by_form, universe, n=g["top_n"],
                            min_names=THRESHOLDS["KC6_MIN_NAMES"])
@@ -187,6 +301,8 @@ def main() -> int:
 
         rows.append({
             "name": name,
+            "lookback": g["lookback"],
+            "top_n": g["top_n"],
             "train_sharpe": weekly_sharpe(train),
             "test_sharpe": weekly_sharpe(test),
             "test_cagr": weekly_cagr(test),
@@ -246,7 +362,6 @@ def main() -> int:
     kc5_pass = (min_wsum >= 1.0 - tol) and (max_wsum <= 1.0 + tol)
 
     sel_min_names = sel["min_names"]
-    bm_test_sharpe = weekly_sharpe(bm_test)
 
     checks = [
         ("PC-1", sel["test_sharpe"] >= bm_test_sharpe,
@@ -274,19 +389,54 @@ def main() -> int:
     kills = [c for c in checks if c[0].startswith("KC") and not c[1]]
     family_pass = all(passed for _, passed, _ in checks)
 
-    label = f"crypto_{instrument}_resmom_{dt.date.today().isoformat()}"
+    from fin_crypto_residual_momentum.sweep import SIGNAL_TAGS
+    tag = SIGNAL_TAGS[signal_type]
+    label = f"crypto_{instrument}_{tag}_{dt.date.today().isoformat()}"
     out = write_verdict(
         rows, checks, family_pass,
         {"selected": sel["name"], "dsr": dsr, "pbo": pbo,
-         "instrument": instrument},
+         "instrument": instrument, "signal_type": signal_type},
         run_label=label,
     )
     for cid, passed, meas in checks:
         log.info("%-5s %s  %s", cid, "PASS" if passed else "FAIL", meas)
     log.info("FAMILY: %s — %s", "PASS" if family_pass else "FAIL", out)
-    if kills:
-        return 2
-    return 0 if family_pass else 1
+
+    exit_code = 2 if kills else (0 if family_pass else 1)
+    return rows, exit_code, bm_test_sharpe
+
+
+def run_compare(instrument: str) -> int:
+    """Run all three signals, then produce a head-to-head comparison."""
+    common = _build_common(instrument)
+    all_rows = {}
+    worst_exit = 0
+    for sig in ("residual", "raw", "blend"):
+        log.info("=== Running %s momentum ===", sig.upper())
+        rows, exit_code, bm_test_sharpe = run_signal(instrument, sig, common)
+        all_rows[sig] = rows
+        worst_exit = max(worst_exit, exit_code)
+
+    out = write_comparison(all_rows, instrument, bm_test_sharpe)
+    log.info("Comparison written to %s", out)
+
+    return worst_exit
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--instrument", required=True,
+                        choices=["spot", "futures"])
+    parser.add_argument("--signal", default="residual",
+                        choices=["residual", "raw", "blend", "compare"])
+    args = parser.parse_args()
+
+    if args.signal == "compare":
+        return run_compare(args.instrument)
+    _, exit_code, _ = run_signal(args.instrument, args.signal)
+    return exit_code
 
 
 if __name__ == "__main__":

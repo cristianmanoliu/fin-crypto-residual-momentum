@@ -1,7 +1,15 @@
-"""Residual momentum signal with configurable beta estimation window."""
+"""Momentum signals: raw and residual (BTC-beta-stripped)."""
 import numpy as np
 
 from fin_crypto_lab.panel import Panel
+from fin_crypto_lab.signals import momentum as _lab_momentum
+
+
+def raw_momentum(
+    panel: Panel, f_idx: int, lookback: int = 365, skip: int = 7,
+) -> np.ndarray:
+    """Raw price momentum via fin-crypto-lab."""
+    return _lab_momentum(panel, f_idx, lookback=lookback, skip=skip)
 
 
 def residual_momentum(
@@ -62,4 +70,25 @@ def residual_momentum(
         resid = fy - alpha - beta * fx
         out[j] = float(np.sum(resid))
 
+    return out
+
+
+def blend_momentum(
+    panel: Panel, f_idx: int, lookback: int = 365, skip: int = 7,
+    market_col: int | None = None, beta_window: int | None = None,
+) -> np.ndarray:
+    """50/50 rank-average of raw and residual momentum."""
+    raw = raw_momentum(panel, f_idx, lookback=lookback, skip=skip)
+    res = residual_momentum(panel, f_idx, lookback=lookback, skip=skip,
+                            market_col=market_col, beta_window=beta_window)
+    n = len(raw)
+    out = np.full(n, np.nan)
+    idx = np.where(np.isfinite(raw) & np.isfinite(res))[0]
+    if len(idx) < 2:
+        return out
+    raw_rank = np.empty(len(idx))
+    res_rank = np.empty(len(idx))
+    raw_rank[np.argsort(raw[idx])] = np.arange(len(idx), dtype=float)
+    res_rank[np.argsort(res[idx])] = np.arange(len(idx), dtype=float)
+    out[idx] = 0.5 * raw_rank + 0.5 * res_rank
     return out

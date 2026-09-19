@@ -20,16 +20,22 @@ battery.
 
 | File | Purpose |
 |---|---|
-| `src/fin_crypto_residual_momentum/signals.py` | `residual_momentum()` with configurable `beta_window` |
-| `src/fin_crypto_residual_momentum/sweep.py` | Extended grid: lookbacks (90, 180, 365) x top (10, 20, 30) x instruments |
-| `src/fin_crypto_residual_momentum/run_sweep.py` | Sweep runner with full honesty battery |
+| `src/fin_crypto_residual_momentum/signals.py` | `residual_momentum()` and `raw_momentum()` |
+| `src/fin_crypto_residual_momentum/sweep.py` | Grids for both signals: lookbacks (90, 180, 365) x top (10, 20, 30) x instruments |
+| `src/fin_crypto_residual_momentum/run_sweep.py` | Sweep runner with honesty battery and head-to-head comparison mode |
 
 ## Commands
 
-Run the sweep:
+Run a single signal sweep:
 ```
-uv run python -m fin_crypto_residual_momentum --instrument spot
-uv run python -m fin_crypto_residual_momentum --instrument futures
+uv run python -m fin_crypto_residual_momentum --instrument spot --signal residual
+uv run python -m fin_crypto_residual_momentum --instrument spot --signal raw
+```
+
+Run head-to-head comparison (both signals, then side-by-side):
+```
+uv run python -m fin_crypto_residual_momentum --instrument spot --signal compare
+uv run python -m fin_crypto_residual_momentum --instrument futures --signal compare
 ```
 
 Run tests:
