@@ -1,72 +1,38 @@
 # fin-crypto-residual-momentum
 
-Cross-sectional momentum after stripping BTC beta. Rank coins by cumulative
-residual return (alpha relative to BTC), not raw return.
+Cross-sectional momentum after removing BTC beta. This strategy ranks coins by cumulative residual return (alpha relative to BTC), not raw return.
 
-## Origin
+## Why residual momentum
 
-Research idea #4 from `fin-crypto-lab` (2026-09-19). Standard momentum in
-crypto is contaminated by BTC beta. When BTC rallies, everything rallies.
-Raw momentum ranks "most exposed to BTC" rather than genuine idiosyncratic
-strength. Residual momentum removes this confound.
+Standard momentum in crypto includes BTC beta noise. When BTC rallies, everything rallies. Raw momentum ranks the coins with the most BTC exposure, not the coins with the strongest idiosyncratic performance. Residual momentum removes this bias.
 
-## What we know
-
-- Requires no new data. Uses the same spot (or futures) OHLCV from
-  `fin-crypto-lab`.
-- Implementation: rolling 90-day OLS regression of each pair's daily returns
-  on BTC daily returns. Signal = cumulative residual return over the lookback
-  window.
-- Academic basis: Blitz & Vidojevic 2021 document the idiosyncratic momentum
-  anomaly in equities. The same logic applies to crypto, where BTC is the
-  dominant common factor.
+Academic basis: Blitz and Vidojevic (2021) document the idiosyncratic momentum anomaly in equities. The same logic applies to crypto, where BTC is the dominant shared cause of price movement.
 
 ## Signal construction
 
-For each coin `i` on each formation date:
+For each coin on each formation date:
 
-1. Take the trailing `L` days of daily returns for coin `i` and BTC.
-2. Run OLS: `r_i = alpha + beta * r_BTC + epsilon`.
+1. Get the trailing `L` days of daily returns for the coin and BTC.
+2. Operate OLS: `r_i = alpha + beta * r_BTC + epsilon`.
 3. Signal = sum of residuals (cumulative idiosyncratic return).
-4. Rank coins by signal. Go long the top N, short the bottom N (or long-only
-   top N if shorting is not available on spot).
+4. Rank coins by signal. Go long the top N, short the bottom N (or long-only top N on spot).
 
-## What to do next
+## Sweep grid
 
-### Phase 1: Implementation
+Lookbacks: 90, 180, 365 days. Portfolio dimensions: top 10, 20, 30. Instruments: spot and futures. A `beta_window` parameter controls the trailing window for the OLS beta estimate. The strategy calculates residuals on the full lookback window.
 
-1. Add a `residual_momentum_signal()` function to the signal module. Inputs:
-   returns DataFrame, BTC returns Series, lookback. Output: signal Series.
-2. Run the same grid as `fin-crypto-lab`: lookbacks (90, 180, 365), portfolio
-   sizes (top 10, 20, 30), spot + futures.
-3. Apply the honesty battery.
+## Honesty battery
 
-### Phase 2: Comparison
-
-4. Compare residual momentum to raw momentum head-to-head on the same
-   universe and cost model. The value is in the DIFFERENCE.
-5. If residual momentum passes and raw does not, the BTC-beta contamination
-   hypothesis is confirmed.
-6. Test a blend: 50% raw + 50% residual momentum.
-
-### Phase 3: Robustness
-
-7. Try different rolling windows for the beta estimate (60, 90, 120 days).
-8. Try multi-factor residuals (BTC + ETH) instead of BTC-only.
-
-## Honesty method
-
-Same battery as `fin-crypto-lab`: DSR, PBO, train/test Sharpe, kill
-conditions. The grid is larger (adds rolling window variants), so the
-multiple-testing correction penalty is higher.
+Same battery as `fin-crypto-lab`: DSR, PBO, train/test Sharpe, kill conditions. The grid is larger than `fin-crypto-lab` (adds beta-window variants), so the multiple-testing correction penalty is higher.
 
 ## Key risk
 
-**Beta estimation noise.** With only 90 days of daily returns, the OLS beta
-estimate is noisy. Coins with low liquidity will have unreliable betas,
-producing noisy residuals. A minimum-liquidity filter is essential.
+With only 90 days of daily returns, the OLS beta estimate has high noise. Coins with low liquidity produce unreliable betas and noisy residuals. A minimum-liquidity filter is necessary.
 
-## Reference
+## Dependencies
 
-Blitz & Vidojevic 2021: "The Idiosyncratic Momentum Anomaly"
-(https://doi.org/10.2139/ssrn.3838856).
+This project depends on `fin-crypto-lab` as a path dependency (`../fin-crypto-lab`). Clone `fin-crypto-lab` as a sibling directory before you use this project.
+
+## Source
+
+Blitz, D. and Vidojevic, M. (2021). "The Idiosyncratic Momentum Anomaly." https://doi.org/10.2139/ssrn.3838856
